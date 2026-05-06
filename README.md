@@ -1,4 +1,4 @@
-RutaFácil
+##RutaFácil##
 Aplicación Android para planificación de rutas en Bogotá, Colombia. Permite calcular trayectos con múltiples paradas usando Google Maps y la API de Directions.
 
 Funcionalidades
