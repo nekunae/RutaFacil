@@ -1,5 +1,11 @@
 package com.nekunae.rutafacil
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
+import androidx.compose.runtime.*
 import android.Manifest
 import android.annotation.SuppressLint
 import android.os.Build
@@ -53,9 +59,26 @@ val MARKER_COLORS = listOf(
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { RutaFacilTheme { MainScreen() } }
-    }
-}
+        setContent {
+            RutaFacilTheme {
+                var showSplash by remember { mutableStateOf(true) }
+
+                AnimatedContent(
+                    targetState = showSplash,
+                    transitionSpec = {
+                        fadeIn(tween(400)) togetherWith fadeOut(tween(400))
+                    }
+                ) { isSplash ->
+                    if (isSplash) {
+                        SplashScreen(onFinished = { showSplash = false })
+                    } else {
+                        MainScreen()
+                    }
+                }
+            }
+        }
+    }  // ← cierre de onCreate
+}      // ← cierre de MainActivity
 
 data class RouteInfo(
     val polylinePoints: List<LatLng>,
