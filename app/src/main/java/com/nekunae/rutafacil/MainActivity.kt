@@ -8,14 +8,12 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.runtime.*
 import android.Manifest
 import android.annotation.SuppressLint
-import android.os.Build
 import android.os.Bundle
 import android.os.Looper
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.annotation.RequiresApi
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
@@ -27,7 +25,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
-import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -46,6 +43,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.URL
 import java.net.URLEncoder
+import kotlin.math.*
 
 const val GOOGLE_MAPS_API_KEY = "AIzaSyCJCnArRYnQ8euZF4p28w-F2yNYas8QE48"
 
@@ -80,7 +78,44 @@ data class RouteInfo(
 
 enum class InputMode { MAP, TEXT }
 
-// ── Pantalla principal ───────────────────────────────────────────────────────
+// ── Utilidad: distancia en metros entre dos LatLng (fórmula Haversine) ────────
+
+fun haversineMeters(a: LatLng, b: LatLng): Double {
+    val R = 6_371_000.0
+    val dLat = Math.toRadians(b.latitude - a.latitude)
+    val dLng = Math.toRadians(b.longitude - a.longitude)
+    val sinDLat = sin(dLat / 2)
+    val sinDLng = sin(dLng / 2)
+    val h = sinDLat * sinDLat +
+            cos(Math.toRadians(a.latitude)) * cos(Math.toRadians(b.latitude)) * sinDLng * sinDLng
+    return 2 * R * asin(sqrt(h))
+}
+
+// ── CAMBIO: Recorta la polilínea eliminando los puntos ya recorridos ──────────
+//
+// Busca el punto de la polilínea más cercano a `userLoc` y devuelve
+// solo los puntos desde ese índice en adelante.
+// Si el punto más cercano está a más de `snapThresholdM` metros (señal
+// de que el usuario se desvió mucho), devuelve la lista completa para
+// que el llamador decida recalcular.
+//
+fun trimPolyline(
+    polyline: List<LatLng>,
+    userLoc: LatLng,
+    snapThresholdM: Double = 50.0
+): Pair<List<LatLng>, Boolean> {
+    if (polyline.isEmpty()) return Pair(emptyList(), false)
+    var minDist = Double.MAX_VALUE
+    var minIdx = 0
+    polyline.forEachIndexed { i, pt ->
+        val d = haversineMeters(userLoc, pt)
+        if (d < minDist) { minDist = d; minIdx = i }
+    }
+    val offRoute = minDist > snapThresholdM
+    return Pair(polyline.subList(minIdx, polyline.size), offRoute)
+}
+
+// ── Pantalla principal ────────────────────────────────────────────────────────
 
 @Composable
 fun MainScreen() {
@@ -108,7 +143,7 @@ fun MainScreen() {
     }
 }
 
-// ── Pantalla de Mapa ─────────────────────────────────────────────────────────
+// ── Pantalla de Mapa ──────────────────────────────────────────────────────────
 
 @SuppressLint("MissingPermission")
 @Composable
@@ -136,12 +171,20 @@ fun MapScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var hasLocationPermission by remember { mutableStateOf(false) }
 
-    // ── Estados de seguimiento en tiempo real ─────────────────────────────────
+    // ── Estados de seguimiento ────────────────────────────────────────────────
     var userLocation by remember { mutableStateOf<LatLng?>(null) }
     var isTracking by remember { mutableStateOf(false) }
-    var followCamera by remember { mutableStateOf(true) }   // la cámara sigue al usuario mientras trackea
+    var followCamera by remember { mutableStateOf(true) }
 
-    // Animación del pulso del indicador GPS
+    // ── CAMBIO: polilínea "viva" que se va recortando durante el seguimiento ──
+    // `livePolyline` es una copia recortada de routeInfo.polylinePoints.
+    // Cuando NO hay seguimiento activo se muestra la ruta completa.
+    var livePolyline by remember { mutableStateOf<List<LatLng>>(emptyList()) }
+
+    // ── CAMBIO: flag para saber si el usuario se desvió y hay que recalcular ─
+    var isRecalculating by remember { mutableStateOf(false) }
+
+    // Animación pulso GPS
     val pulseAnim = rememberInfiniteTransition(label = "pulse")
     val pulseRadius by pulseAnim.animateFloat(
         initialValue = 20f, targetValue = 60f, label = "pulseRadius",
@@ -152,16 +195,44 @@ fun MapScreen() {
         animationSpec = infiniteRepeatable(tween(1200), RepeatMode.Restart)
     )
 
-    // FusedLocationProviderClient reutilizable
     val fusedClient = remember { LocationServices.getFusedLocationProviderClient(context) }
 
-    // LocationCallback — se llama cada vez que llega una nueva posición
     val locationCallback = remember {
         object : LocationCallback() {
             override fun onLocationResult(result: LocationResult) {
                 result.lastLocation?.let { loc ->
                     val ll = LatLng(loc.latitude, loc.longitude)
                     userLocation = ll
+
+                    // ── CAMBIO: recortar polilínea al avanzar ─────────────────
+                    if (isTracking) {
+                        val currentPolyline = routeInfo?.polylinePoints ?: emptyList()
+                        if (currentPolyline.isNotEmpty()) {
+                            val (trimmed, offRoute) = trimPolyline(currentPolyline, ll)
+                            livePolyline = trimmed
+
+                            // Si se desvió más de 50 m, recalcular desde posición actual
+                            if (offRoute && !isRecalculating && waypoints.isNotEmpty()) {
+                                isRecalculating = true
+                                coroutineScope.launch {
+                                    try {
+                                        // Nueva ruta: posición actual → waypoints restantes → destino
+                                        val destination = waypoints.last()
+                                        val newPoints = mutableListOf(ll, destination)
+                                        val newRoute = fetchRouteMulti(newPoints)
+                                        routeInfo = newRoute
+                                        livePolyline = newRoute.polylinePoints
+                                    } catch (_: Exception) {
+                                        // Silenciar error de recálculo; mantiene la ruta anterior
+                                    } finally {
+                                        isRecalculating = false
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Mover cámara
                     if (followCamera) {
                         coroutineScope.launch {
                             cameraPositionState.animate(
@@ -176,23 +247,27 @@ fun MapScreen() {
         }
     }
 
-    // Solicitud de actualizaciones: 1 s de intervalo, 1 s mínimo
     val locationRequest = remember {
         LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1_000L)
             .setMinUpdateIntervalMillis(1_000L)
             .build()
     }
 
-    // Iniciar / detener actualizaciones según isTracking
     LaunchedEffect(isTracking, hasLocationPermission) {
         if (isTracking && hasLocationPermission) {
             fusedClient.requestLocationUpdates(locationRequest, locationCallback, Looper.getMainLooper())
         } else {
             fusedClient.removeLocationUpdates(locationCallback)
+            // ── CAMBIO: al detener, restaurar polilínea completa ─────────────
+            if (!isTracking) livePolyline = routeInfo?.polylinePoints ?: emptyList()
         }
     }
 
-    // Limpiar al salir del composable
+    // ── CAMBIO: sincronizar livePolyline cuando llega una ruta nueva ──────────
+    LaunchedEffect(routeInfo) {
+        if (!isTracking) livePolyline = routeInfo?.polylinePoints ?: emptyList()
+    }
+
     DisposableEffect(Unit) {
         onDispose { fusedClient.removeLocationUpdates(locationCallback) }
     }
@@ -208,16 +283,25 @@ fun MapScreen() {
         waypoints.clear()
         waypointTexts.clear()
         waypointTexts.addAll(listOf("", ""))
-        routeInfo = null; errorMessage = null; isTracking = false
+        routeInfo = null
+        livePolyline = emptyList()   // ── CAMBIO
+        errorMessage = null
+        isTracking = false
     }
 
     fun calculateMultiRoute(points: List<LatLng>) {
         if (points.size < 2) return
         coroutineScope.launch {
             isLoadingRoute = true; errorMessage = null
-            try { routeInfo = fetchRouteMulti(points) }
-            catch (e: Exception) { errorMessage = "No se pudo calcular: ${e.message}" }
-            finally { isLoadingRoute = false }
+            try {
+                val info = fetchRouteMulti(points)
+                routeInfo = info
+                livePolyline = info.polylinePoints   // ── CAMBIO
+            } catch (e: Exception) {
+                errorMessage = "No se pudo calcular: ${e.message}"
+            } finally {
+                isLoadingRoute = false
+            }
         }
     }
 
@@ -231,10 +315,15 @@ fun MapScreen() {
                     geocodeAddress(addr) ?: throw Exception("No encontrado: \"$addr\"")
                 }
                 waypoints.clear(); waypoints.addAll(resolved)
-                routeInfo = fetchRouteMulti(resolved)
+                val info = fetchRouteMulti(resolved)
+                routeInfo = info
+                livePolyline = info.polylinePoints   // ── CAMBIO
                 cameraPositionState.position = CameraPosition.fromLatLngZoom(resolved.first(), 13f)
-            } catch (e: Exception) { errorMessage = e.message }
-            finally { isLoadingRoute = false }
+            } catch (e: Exception) {
+                errorMessage = e.message
+            } finally {
+                isLoadingRoute = false
+            }
         }
     }
 
@@ -258,14 +347,14 @@ fun MapScreen() {
         GoogleMap(
             modifier = Modifier.fillMaxSize(),
             cameraPositionState = cameraPositionState,
-            properties = MapProperties(isMyLocationEnabled = false), // usamos nuestro indicador custom
+            properties = MapProperties(isMyLocationEnabled = false),
             uiSettings = MapUiSettings(myLocationButtonEnabled = false),
             onMapClick = { latLng ->
                 if (inputMode == InputMode.MAP && !isLoadingRoute) {
-                    waypoints.add(latLng); routeInfo = null
+                    waypoints.add(latLng); routeInfo = null; livePolyline = emptyList()
                     if (waypoints.size >= 2) calculateMultiRoute(waypoints.toList())
                 }
-                followCamera = false // el usuario movió el mapa manualmente
+                followCamera = false
             }
         ) {
             // Marcadores de waypoints
@@ -282,7 +371,6 @@ fun MapScreen() {
 
             // Indicador de posición en tiempo real
             userLocation?.let { loc ->
-                // Anillo de pulso (solo cuando está trackeando)
                 if (isTracking) {
                     Circle(
                         center = loc,
@@ -292,7 +380,6 @@ fun MapScreen() {
                         strokeWidth = 2f
                     )
                 }
-                // Punto sólido de posición
                 Circle(
                     center = loc,
                     radius = 12.0,
@@ -302,9 +389,11 @@ fun MapScreen() {
                 )
             }
 
-            // Polilínea de ruta
-            routeInfo?.let { route ->
-                Polyline(points = route.polylinePoints, color = Color(0xFF1565C0), width = 12f)
+            // ── CAMBIO: dibuja livePolyline en lugar de routeInfo directamente ─
+            // Cuando hay seguimiento activo, livePolyline es la ruta recortada.
+            // Cuando no, es la ruta completa (mismos puntos que antes).
+            if (livePolyline.size >= 2) {
+                Polyline(points = livePolyline, color = Color(0xFF1565C0), width = 12f)
             }
         }
 
@@ -313,7 +402,6 @@ fun MapScreen() {
             modifier = Modifier.align(Alignment.TopEnd).padding(top = 12.dp, end = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Botón centrar cámara en mi posición
             FloatingActionButton(
                 onClick = {
                     followCamera = true
@@ -331,7 +419,6 @@ fun MapScreen() {
             ) {
                 Icon(Icons.Default.MyLocation, contentDescription = "Centrar", modifier = Modifier.size(20.dp))
             }
-            // Toggle modo entrada
             FloatingActionButton(
                 onClick = {
                     inputMode = if (inputMode == InputMode.MAP) InputMode.TEXT else InputMode.MAP
@@ -402,12 +489,21 @@ fun MapScreen() {
         }
 
         // ── Loading ───────────────────────────────────────────────────────────
-        if (isLoadingRoute) {
-            Surface(modifier = Modifier.align(Alignment.Center), shape = MaterialTheme.shapes.medium,
-                color = MaterialTheme.colorScheme.surface, tonalElevation = 8.dp) {
-                Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (isLoadingRoute || isRecalculating) {
+            Surface(
+                modifier = Modifier.align(Alignment.Center),
+                shape = MaterialTheme.shapes.medium,
+                color = MaterialTheme.colorScheme.surface,
+                tonalElevation = 8.dp
+            ) {
+                Row(
+                    Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
                     CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
-                    Text("Calculando ruta…")
+                    // ── CAMBIO: mensaje diferente si es recálculo ─────────────
+                    Text(if (isRecalculating) "Recalculando ruta…" else "Calculando ruta…")
                 }
             }
         }
@@ -420,7 +516,7 @@ fun MapScreen() {
             ) { Text(msg) }
         }
 
-        // ── Panel inferior: info de ruta + controles ───────────────────────────
+        // ── Panel inferior ────────────────────────────────────────────────────
         Column(
             modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
@@ -428,13 +524,19 @@ fun MapScreen() {
             routeInfo?.let { route ->
                 Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(6.dp)) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        // Encabezado con badge de tracking
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
                             Text("Ruta con ${waypoints.size} puntos", style = MaterialTheme.typography.titleMedium)
                             if (isTracking) {
                                 Surface(shape = MaterialTheme.shapes.extraLarge, color = Color(0xFF1B5E20)) {
-                                    Row(modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        // Punto parpadeante
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
                                         val blinkAnim by rememberInfiniteTransition(label = "blink")
                                             .animateFloat(0f, 1f, infiniteRepeatable(tween(600), RepeatMode.Reverse), label = "blinkAlpha")
                                         Box(modifier = Modifier.size(8.dp).background(Color(0xFF69F0AE).copy(alpha = blinkAnim), shape = MaterialTheme.shapes.extraLarge))
@@ -447,13 +549,15 @@ fun MapScreen() {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
                             RouteInfoItem("Distancia", route.distanceText)
                             RouteInfoItem("Duración", route.durationText)
-                            // Mostrar velocidad si está trackeando
-                            userLocation?.let {
-                                RouteInfoItem("GPS", "Activo")
+                            // ── CAMBIO: mostrar tramo restante ────────────────
+                            if (isTracking && livePolyline.size >= 2) {
+                                val remainingKm = estimateRemainingKm(livePolyline)
+                                RouteInfoItem("Restante", if (remainingKm >= 1.0) "${"%.1f".format(remainingKm)} km" else "${(remainingKm * 1000).toInt()} m")
+                            } else {
+                                userLocation?.let { RouteInfoItem("GPS", "Activo") }
                             }
                         }
                         Spacer(Modifier.height(12.dp))
-                        // ── Botón de seguimiento ──────────────────────────────────────────────
                         Button(
                             onClick = {
                                 if (!hasLocationPermission) {
@@ -465,6 +569,8 @@ fun MapScreen() {
                                 }
                                 isTracking = !isTracking
                                 if (isTracking) followCamera = true
+                                // ── CAMBIO: al reactivar, resetear livePolyline ─
+                                else livePolyline = routeInfo?.polylinePoints ?: emptyList()
                             },
                             modifier = Modifier.fillMaxWidth(),
                             colors = ButtonDefaults.buttonColors(
@@ -482,13 +588,12 @@ fun MapScreen() {
                 }
             }
 
-            // Botones deshacer / limpiar
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 if (waypoints.isNotEmpty()) {
                     OutlinedButton(
                         onClick = {
                             if (waypoints.isNotEmpty()) {
-                                waypoints.removeLast(); routeInfo = null
+                                waypoints.removeLast(); routeInfo = null; livePolyline = emptyList()
                                 if (waypoints.size >= 2) calculateMultiRoute(waypoints.toList())
                             }
                         }, modifier = Modifier.weight(1f)
@@ -502,6 +607,14 @@ fun MapScreen() {
             }
         }
     }
+}
+
+// ── CAMBIO: calcula km restantes sumando segmentos de la polilínea recortada ──
+
+fun estimateRemainingKm(polyline: List<LatLng>): Double {
+    var total = 0.0
+    for (i in 0 until polyline.size - 1) total += haversineMeters(polyline[i], polyline[i + 1])
+    return total / 1000.0
 }
 
 @Composable
