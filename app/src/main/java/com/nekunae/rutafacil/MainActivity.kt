@@ -19,6 +19,7 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -45,7 +46,7 @@ import java.net.URL
 import java.net.URLEncoder
 import kotlin.math.*
 
-const val GOOGLE_MAPS_API_KEY = "AIzaSyCJCnArRYnQ8euZF4p28w-F2yNYas8QE48"
+const val GOOGLE_MAPS_API_KEY = "AIzaSyAW_rynJB10JvhhZb75mbZ6AEm3MdMrnmI"
 
 val MARKER_COLORS = listOf(
     Color(0xFF4CAF50), Color(0xFF2196F3), Color(0xFFFF9800),
@@ -58,6 +59,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             RutaFacilTheme {
                 var showSplash by remember { mutableStateOf(true) }
+
+                // ── CAMBIO FIREBASE: autenticar de forma anónima al arrancar ──
+                LaunchedEffect(Unit) {
+                    LocationRepository.ensureSignedIn()
+                }
+
                 AnimatedContent(
                     targetState = showSplash,
                     transitionSpec = { fadeIn(tween(400)) togetherWith fadeOut(tween(400)) }
@@ -77,6 +84,21 @@ data class RouteInfo(
 )
 
 enum class InputMode { MAP, TEXT }
+
+// ── CAMBIO: rutas predefinidas seleccionables desde la pantalla de Lista ──────
+
+data class PresetRoute(val id: String, val label: String, val addresses: List<String>)
+
+val PRESET_IDA_ADDRESSES = listOf(
+    "Cl. 13 #16-74, Bogotá",
+    "Carrera 30 y Calle 57, Teusaquillo, Bogotá",
+    "Tv. 3C. 49 - 02 Bogotá D.C."
+)
+
+val PRESET_ROUTES = listOf(
+    PresetRoute(id = "ida", label = "Ida", addresses = PRESET_IDA_ADDRESSES),
+    PresetRoute(id = "vuelta", label = "Vuelta", addresses = PRESET_IDA_ADDRESSES.reversed())
+)
 
 // ── Utilidad: distancia en metros entre dos LatLng (fórmula Haversine) ────────
 
@@ -120,6 +142,10 @@ fun trimPolyline(
 @Composable
 fun MainScreen() {
     var selectedTab by remember { mutableStateOf(0) }
+
+    // ── CAMBIO: direcciones activas del mapa; empiezan con la ruta "Ida" ──────
+    var activeAddresses by remember { mutableStateOf(PRESET_IDA_ADDRESSES) }
+
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -136,8 +162,15 @@ fun MainScreen() {
     ) { padding ->
         Box(modifier = Modifier.padding(padding)) {
             when (selectedTab) {
-                0 -> MapScreen()
-                1 -> ListScreen()
+                // key() fuerza que MapScreen se recree con las nuevas direcciones
+                // cada vez que se elige una ruta desde la Lista.
+                0 -> key(activeAddresses) { MapScreen(initialAddresses = activeAddresses) }
+                1 -> ListScreen(
+                    onSelectRoute = { addresses ->
+                        activeAddresses = addresses
+                        selectedTab = 0
+                    }
+                )
             }
         }
     }
@@ -147,7 +180,7 @@ fun MainScreen() {
 
 @SuppressLint("MissingPermission")
 @Composable
-fun MapScreen() {
+fun MapScreen(initialAddresses: List<String> = PRESET_IDA_ADDRESSES) {
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
     val coroutineScope = rememberCoroutineScope()
@@ -159,13 +192,8 @@ fun MapScreen() {
 
     var inputMode by remember { mutableStateOf(InputMode.TEXT) }
     val waypoints = remember { mutableStateListOf<LatLng>() }
-    val waypointTexts = remember {
-        mutableStateListOf(
-            "Cl. 13 #16-74, Bogotá",
-            "Carrera 30 y Calle 57, Teusaquillo, Bogotá",
-            "Tv. 3C. 49 - 02 Bogotá D.C."
-        )
-    }
+    // ── CAMBIO: ahora arranca con las direcciones que llegan por parámetro ────
+    val waypointTexts = remember { mutableStateListOf(*initialAddresses.toTypedArray()) }
     var routeInfo by remember { mutableStateOf<RouteInfo?>(null) }
     var isLoadingRoute by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -175,6 +203,10 @@ fun MapScreen() {
     var userLocation by remember { mutableStateOf<LatLng?>(null) }
     var isTracking by remember { mutableStateOf(false) }
     var followCamera by remember { mutableStateOf(true) }
+
+    // ── CAMBIO FIREBASE: estado de guardado de ruta ───────────────────────────
+    var isSavingRoute by remember { mutableStateOf(false) }
+    var saveConfirmation by remember { mutableStateOf<String?>(null) }
 
     // ── CAMBIO: polilínea "viva" que se va recortando durante el seguimiento ──
     // `livePolyline` es una copia recortada de routeInfo.polylinePoints.
@@ -323,6 +355,27 @@ fun MapScreen() {
                 errorMessage = e.message
             } finally {
                 isLoadingRoute = false
+            }
+        }
+    }
+
+    // ── CAMBIO FIREBASE: guarda la ruta actual en Firestore ───────────────────
+    fun saveCurrentRoute() {
+        val route = routeInfo ?: return
+        coroutineScope.launch {
+            isSavingRoute = true
+            try {
+                LocationRepository.saveRoute(
+                    waypointLabels = waypointTexts.toList(),
+                    waypoints = waypoints.toList(),
+                    distanceText = route.distanceText,
+                    durationText = route.durationText
+                )
+                saveConfirmation = "Ruta guardada"
+            } catch (e: Exception) {
+                errorMessage = "No se pudo guardar: ${e.message}"
+            } finally {
+                isSavingRoute = false
             }
         }
     }
@@ -516,6 +569,17 @@ fun MapScreen() {
             ) { Text(msg) }
         }
 
+        // ── CAMBIO FIREBASE: confirmación de guardado ─────────────────────────
+        saveConfirmation?.let { msg ->
+            LaunchedEffect(msg) {
+                kotlinx.coroutines.delay(2000)
+                saveConfirmation = null
+            }
+            Snackbar(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 80.dp, start = 16.dp, end = 16.dp)
+            ) { Text(msg) }
+        }
+
         // ── Panel inferior ────────────────────────────────────────────────────
         Column(
             modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
@@ -558,6 +622,23 @@ fun MapScreen() {
                             }
                         }
                         Spacer(Modifier.height(12.dp))
+
+                        // ── CAMBIO FIREBASE: botón para guardar la ruta ───────
+                        OutlinedButton(
+                            onClick = { saveCurrentRoute() },
+                            enabled = !isSavingRoute,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            if (isSavingRoute) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.Save, null, modifier = Modifier.size(16.dp))
+                            }
+                            Spacer(Modifier.width(6.dp))
+                            Text("Guardar ruta")
+                        }
+                        Spacer(Modifier.height(8.dp))
+
                         Button(
                             onClick = {
                                 if (!hasLocationPermission) {
@@ -682,16 +763,142 @@ fun decodePolyline(encoded: String): List<LatLng> {
 }
 
 // ── Lista ─────────────────────────────────────────────────────────────────────
+// ── CAMBIO FIREBASE: ahora muestra favoritos y rutas guardadas en Firestore ──
 
 @Composable
-fun ListScreen() {
-    var text by remember { mutableStateOf("") }
-    val items = remember { mutableStateListOf<String>() }
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        OutlinedTextField(value = text, onValueChange = { text = it }, label = { Text("Agregar texto") }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(8.dp))
-        Button(onClick = { if (text.isNotBlank()) { items.add(text); text = "" } }, modifier = Modifier.fillMaxWidth()) { Text("Añadir") }
-        Spacer(Modifier.height(16.dp))
-        LazyColumn { itemsIndexed(items) { _, item -> Text(item, modifier = Modifier.padding(8.dp)) } }
+fun ListScreen(onSelectRoute: (List<String>) -> Unit) {
+    val coroutineScope = rememberCoroutineScope()
+    var favorites by remember { mutableStateOf<List<FavoritePlace>>(emptyList()) }
+    var routes by remember { mutableStateOf<List<SavedRoute>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    // ── CAMBIO: ruta rápida seleccionada (Ida / Vuelta) ───────────────────────
+    var selectedPresetId by remember { mutableStateOf(PRESET_ROUTES.first().id) }
+
+    suspend fun reload() {
+        try {
+            favorites = LocationRepository.getFavoritePlaces()
+            routes = LocationRepository.getRecentRoutes()
+        } catch (e: Exception) {
+            errorMessage = "No se pudo cargar: ${e.message}"
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        loading = true
+        reload()
+        loading = false
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (loading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        } else {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                // ── CAMBIO: sección de rutas rápidas Ida / Vuelta ─────────────
+                item { Text("Rutas rápidas", style = MaterialTheme.typography.titleMedium) }
+                items(PRESET_ROUTES, key = { it.id }) { preset ->
+                    val isSelected = selectedPresetId == preset.id
+                    Card(
+                        onClick = { selectedPresetId = preset.id },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer
+                            else MaterialTheme.colorScheme.surfaceVariant
+                        ),
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(selected = isSelected, onClick = { selectedPresetId = preset.id })
+                            Spacer(Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(preset.label, style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    preset.addresses.joinToString(" → "),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                            }
+                        }
+                    }
+                }
+                item {
+                    Button(
+                        onClick = {
+                            PRESET_ROUTES.find { it.id == selectedPresetId }?.let { onSelectRoute(it.addresses) }
+                        },
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 12.dp)
+                    ) {
+                        Icon(Icons.Default.Navigation, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Usar esta ruta")
+                    }
+                }
+
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Favoritos", style = MaterialTheme.typography.titleMedium)
+                        IconButton(onClick = { coroutineScope.launch { reload() } }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Actualizar")
+                        }
+                    }
+                }
+                if (favorites.isEmpty()) {
+                    item { Text("Aún no tienes lugares favoritos", style = MaterialTheme.typography.bodySmall) }
+                }
+                items(favorites, key = { it.id }) { place ->
+                    ListItem(
+                        headlineContent = { Text(place.label.ifBlank { "Sin nombre" }) },
+                        supportingContent = { Text(place.address) },
+                        leadingContent = { Icon(Icons.Default.Star, null) },
+                        trailingContent = {
+                            IconButton(onClick = {
+                                coroutineScope.launch {
+                                    LocationRepository.deleteFavoritePlace(place.id)
+                                    reload()
+                                }
+                            }) { Icon(Icons.Default.Delete, contentDescription = "Eliminar") }
+                        }
+                    )
+                }
+
+                item { Spacer(Modifier.height(16.dp)); Text("Rutas recientes", style = MaterialTheme.typography.titleMedium) }
+                if (routes.isEmpty()) {
+                    item { Text("Aún no has guardado ninguna ruta", style = MaterialTheme.typography.bodySmall) }
+                }
+                items(routes, key = { it.id }) { r ->
+                    ListItem(
+                        headlineContent = { Text(r.waypointLabels.filter { it.isNotBlank() }.joinToString(" → ")) },
+                        supportingContent = { Text("${r.distanceText} · ${r.durationText}") },
+                        leadingContent = { Icon(Icons.Default.Route, null) },
+                        trailingContent = {
+                            IconButton(onClick = {
+                                coroutineScope.launch {
+                                    LocationRepository.deleteRoute(r.id)
+                                    reload()
+                                }
+                            }) { Icon(Icons.Default.Delete, contentDescription = "Eliminar") }
+                        }
+                    )
+                }
+            }
+        }
+
+        errorMessage?.let { msg ->
+            Snackbar(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(16.dp),
+                action = { TextButton(onClick = { errorMessage = null }) { Text("OK") } }
+            ) { Text(msg) }
+        }
     }
 }

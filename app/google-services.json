@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1068265338221",
+    "project_id": "rutafacil-c4307",
+    "storage_bucket": "rutafacil-c4307.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1068265338221:android:dcefa0d9041fc0e376d664",
+        "android_client_info": {
+          "package_name": "com.nekunae.rutafacil"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCnKRkjbGavd0W8LtIRarz9rpJBHM_lFgk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

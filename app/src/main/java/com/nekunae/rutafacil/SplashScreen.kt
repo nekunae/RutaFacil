@@ -141,7 +141,7 @@ fun SplashScreen(onFinished: () -> Unit) {
 
         // Versión abajo
         Text(
-            text = "v1.0.0",
+            text = "v0.3α",
             fontSize = 12.sp,
             color = Color.White.copy(alpha = 0.4f),
             modifier = Modifier
